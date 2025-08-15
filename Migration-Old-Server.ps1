@@ -1,13 +1,11 @@
 <#  OD-Migrate-Old.ps1
     Purpose: Prep and publish a safe migration “package” for Open Dental.
 
-    New in this build:
-    - Detects DB engine/version from the running service binary
-    - Writes od_migration.json with engine/version and the proper Open Dental Trial link
-    - Temporary SMB share allows write so NEW server can drop COPIED.txt
-    - Grants NTFS Modify ONLY on the specific Package_* folder
-
-    Run as Administrator on the OLD server.
+    This build:
+    - Detects DB engine/version from the service binary
+    - Writes od_migration.json with engine/version + suggested Trial URL
+    - Creates a temp SMB share with Everyone: Change (so NEW can write COPIED.txt)
+    - Grants NTFS Modify on the specific Package_* folder
 #>
 
 [CmdletBinding()]
@@ -38,7 +36,6 @@ function Get-ServiceBinaryPath {
   param([string]$ServiceName)
   $svcWmi = Get-WmiObject Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
   if (-not $svcWmi) { return $null }
-  # Extract the first quoted path or first token
   $path = $svcWmi.PathName
   if ($path -match '^"([^"]+)"') { return $matches[1] }
   else { return ($path.Split(' '))[0] }
@@ -54,18 +51,19 @@ function Detect-DBVersion {
     return [pscustomobject]@{ Engine=$svc.DisplayName; VersionFull=$null; MajorMinor=$null; Bin=$null }
   }
   $verOut = & $bin --version 2>&1
-  $engine = ($verOut -match 'MariaDB') ? 'MariaDB' : 'MySQL'
-  if ($verOut -match '(\d+\.\d+(\.\d+)?)') { $vf = $matches[1] } else { $vf = $null }
+  $engine = if ($verOut -match 'MariaDB') { 'MariaDB' } else { 'MySQL' }
+  $m = [regex]::Match($verOut, '\d+\.\d+(\.\d+)?')
+  $vf = if ($m.Success) { $m.Value } else { $null }
   $mm = $null; if ($vf) { $mm = ($vf -split '\.')[0..1] -join '.' }
   [pscustomobject]@{ Engine=$engine; VersionFull=$vf; MajorMinor=$mm; Bin=$bin }
 }
 
 function Get-ODTrialInfo {
   param([string]$Engine,[string]$MajorMinor)
-  # Current Trial links from Open Dental (may change over time):
-  $trialDefault = 'https://opendental.com/TrialDownload-24-3-54.exe'   # general trial
+  # Known Trial links (update if OD changes):
+  $trialDefault = 'https://opendental.com/TrialDownload-24-3-54.exe'   # general trial (MariaDB-capable)
   $maria105     = 'https://opendental.com/TrialDownload-24-1-66.exe'   # MariaDB 10.5 trial
-  $mysql55      = 'https://opendental.com/TrialDownload-20-5-63.exe'   # MySQL 5.5 trial
+  $mysql55      = 'https://opendental.com/TrialDownload-20-5-63.exe'   # MySQL 5.5 trial (used for 5.6 path)
   $upgrade56    = 'https://opendental.com/site/mysql56update.html'     # MySQL 5.6 upgrade guide
 
   $trialUrl = $trialDefault
@@ -78,16 +76,18 @@ function Get-ODTrialInfo {
     $trialUrl = $mysql55
     $notes += 'MySQL 5.5 installer.'
   } elseif ($Engine -match 'MySQL' -and $MajorMinor -eq '5.6') {
-    # Per OD docs: install MySQL 5.5 trial first, then upgrade to 5.6 on the NEW server.
     $trialUrl = $mysql55
     $notes += 'Install MySQL 5.5 trial, then upgrade to 5.6 on NEW server.'
   } else {
     $notes += 'General trial installer (contains MariaDB).'
   }
 
+  $upgradeUrl = $null
+  if ($Engine -match 'MySQL' -and $MajorMinor -eq '5.6') { $upgradeUrl = $upgrade56 }
+
   [pscustomobject]@{
     trial_url   = $trialUrl
-    upgrade_url = ($Engine -match 'MySQL' -and $MajorMinor -eq '5.6') ? $upgrade56 : $null
+    upgrade_url = $upgradeUrl
     notes       = ($notes -join ' ')
   }
 }
@@ -101,9 +101,8 @@ function Guess-DataDir {
     'C:\Program Files (x86)\MySQL\MySQL Server *\data'
   )
   $hit = $cands |
-    ForEach-Object { Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue } |
-    Where-Object   { $_ -and $_.PSIsContainer } |
-    Select-Object  -First 1
+    ForEach-Object { Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue } |
+    Select-Object -First 1
   if ($hit) { return $hit.FullName }
   Write-Warning "Could not auto-detect MySQL/MariaDB data dir. Using C:\mysql\data as fallback."
   'C:\mysql\data'
@@ -118,8 +117,8 @@ function Guess-MyIni {
     'C:\Windows\my.ini'
   )
   $hit = $cands |
-    ForEach-Object { Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue } |
-    Select-Object  -First 1
+    ForEach-Object { Get-ChildItem -Path $_ -ErrorAction SilentlyContinue } |
+    Select-Object -First 1
   if ($hit) { $hit.FullName } else { $null }
 }
 
@@ -143,6 +142,7 @@ function Find-AtoZPath {
     [int]$MaxDepth = 3
   )
   $candidates = @()
+
   try {
     Get-SmbShare -ErrorAction Stop |
       Where-Object { $_.Name -match 'OpenDentImages' -or $_.Path -match 'OpenDentImages' } |
@@ -150,9 +150,11 @@ function Find-AtoZPath {
         $candidates += [pscustomobject]@{ Path=$_.Path; Score=(Test-AtoZStructure $_.Path); Source='Share' }
       }
   } catch {}
+
   foreach ($p in @($Hint,'C:\OpenDentImages','D:\OpenDentImages','E:\OpenDentImages')) {
     if (Test-Path $p) { $candidates += [pscustomobject]@{ Path=$p; Score=(Test-AtoZStructure $p); Source='Common' } }
   }
+
   $roots = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null }
   foreach ($r in $roots) {
     $queue = @([pscustomobject]@{Path=$r.Root;Depth=0})
@@ -171,10 +173,12 @@ function Find-AtoZPath {
       }
     }
   }
+
   $pick = $candidates | Sort-Object Score -Descending | Select-Object -First 1
   if (-not $pick -or $pick.Score -lt 8) {
     $pick = [pscustomobject]@{ Path=$Hint; Score=0; Source='Fallback' }
   }
+
   if ($ConfirmAtoZ -and $candidates.Count -gt 1) {
     Write-Host "A-to-Z candidates (score):" -ForegroundColor Cyan
     $ordered = $candidates | Sort-Object Score -Descending
@@ -184,6 +188,7 @@ function Find-AtoZPath {
     $sel = Read-Host "Pick index (default 0)"
     if ($sel -match '^\d+$' -and [int]$sel -lt $ordered.Count) { $pick = $ordered[[int]$sel] }
   }
+
   $pick.Path
 }
 
@@ -253,4 +258,81 @@ Write-Verbose "Disabling services…"
 foreach ($s in $toStop) { try { Set-Service -Name $s.Name -StartupType Disabled } catch {} }
 
 # Discover paths + DB version
-$datadir = Guess-Data
+$datadir = Guess-DataDir
+$myini   = Guess-MyIni
+$atoz    = Find-AtoZPath -Hint $AtoZPathHint -ConfirmAtoZ:$ConfirmAtoZ
+$dbInfo  = Detect-DBVersion
+$trial   = if ($dbInfo) { Get-ODTrialInfo -Engine $dbInfo.Engine -MajorMinor $dbInfo.MajorMinor } else { Get-ODTrialInfo -Engine 'Unknown' -MajorMinor $null }
+
+Write-Host "Database data dir : $datadir"
+if ($myini) { Write-Host "my.ini            : $myini" } else { Write-Warning "my.ini not found; continuing." }
+Write-Host "OpenDentImages    : $atoz"
+if ($dbInfo) { Write-Host "Detected DB       : $($dbInfo.Engine) $($dbInfo.VersionFull)" } else { Write-Host "Detected DB       : Unknown" }
+
+# Copy DB data (cold copy)
+Start-SafeCopy -Source $datadir -Dest $pkgDb -LogPath (Join-Path $logDir 'copy_db.log')
+if ($myini) { Copy-Item -Path $myini -Destination $pkgIni -Force }
+
+# Copy A-to-Z
+Start-SafeCopy -Source $atoz -Dest $pkgImg -LogPath (Join-Path $logDir 'copy_atoz.log')
+
+# Optionally rename A-to-Z to prevent writes
+if (-not $SkipRenameAtoZ) {
+  $parent = Split-Path $atoz -Parent
+  $newName = "OpenDentImages_old_$timeTag"
+  try { Rename-Item -Path $atoz -NewName $newName -ErrorAction Stop; Write-Host "Renamed A-to-Z to: $(Join-Path $parent $newName)" -ForegroundColor Yellow }
+  catch { Write-Warning "Could not rename A-to-Z: $_" }
+}
+
+# Write metadata JSON
+$engineVal = if ($dbInfo) { $dbInfo.Engine } else { $null }
+$verFull   = if ($dbInfo) { $dbInfo.VersionFull } else { $null }
+$verMM     = if ($dbInfo) { $dbInfo.MajorMinor } else { $null }
+$binPath   = if ($dbInfo) { $dbInfo.Bin } else { $null }
+
+$meta = [ordered]@{
+  created_utc          = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
+  old_server           = $env:COMPUTERNAME
+  engine               = $engineVal
+  version_full         = $verFull
+  version_major_minor  = $verMM
+  bin_path             = $binPath
+  data_dir             = $datadir
+  my_ini               = $myini
+  atoz_source          = $atoz
+  od_trial_url         = $trial.trial_url
+  od_upgrade_url       = $trial.upgrade_url
+  notes                = $trial.notes
+}
+$meta | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $pkgRoot 'od_migration.json') -Encoding UTF8
+
+# Temp share (write enabled) + NTFS Modify on the specific package
+Ensure-Share -Path $StagingRoot -Name $ShareName
+Grant-NTFSModifyToEveryone -Path $pkgRoot
+
+$shareUNC = "\\$($env:COMPUTERNAME)\$ShareName"
+"ready=$timeTag`nsource=$shareUNC`npackage=$(Split-Path $pkgRoot -Leaf)" | Set-Content (Join-Path $pkgRoot 'READY.txt') -Encoding UTF8
+Write-Host "Share: $shareUNC  (Everyone: Change)" -ForegroundColor Cyan
+Write-Host "Package: $pkgRoot" -ForegroundColor Cyan
+Write-Host "Suggested Trial URL: $($trial.trial_url)" -ForegroundColor Gray
+if ($trial.upgrade_url) { Write-Host "Upgrade guide: $($trial.upgrade_url)" -ForegroundColor Gray }
+
+# Optional firewall block
+if (-not $NoFirewallBlock3306) {
+  if (-not (Get-NetFirewallRule -DisplayName 'Block MySQL 3306 (OD Migration)' -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName 'Block MySQL 3306 (OD Migration)' -Direction Inbound -Action Block -Protocol TCP -LocalPort 3306 | Out-Null
+    Write-Host "Blocked inbound port 3306 on OLD server." -ForegroundColor Yellow
+  }
+}
+
+# Wait for new server signal
+Write-Host "`n=== Waiting for NEW server to write COPIED.txt … Ctrl+C to abort ==="
+$copiedFlag = Join-Path $pkgRoot 'COPIED.txt'
+while (-not (Test-Path $copiedFlag)) { Start-Sleep -Seconds 5 }
+
+# Cleanup share
+Write-Host "New server signaled copy complete." -ForegroundColor Green
+Write-Host "Removing temporary share…" -ForegroundColor Gray
+try { Remove-Share -Name $ShareName } catch { Write-Warning $_ }
+
+Write-Host "Old server is locked down. Leave services disabled to prevent clients reconnecting." -ForegroundColor Yellow
