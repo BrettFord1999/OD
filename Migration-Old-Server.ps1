@@ -1,9 +1,13 @@
 <#  OD-Migrate-Old.ps1
     Purpose: Prep and publish a safe migration “package” for Open Dental.
 
-    Changes in this version:
-    - Temporary SMB share grants Everyone **Change** (write) so NEW server can write COPIED.txt
-    - NTFS permission: grant Modify to Everyone on the **package folder only**
+    New in this build:
+    - Detects DB engine/version from the running service binary
+    - Writes od_migration.json with engine/version and the proper Open Dental Trial link
+    - Temporary SMB share allows write so NEW server can drop COPIED.txt
+    - Grants NTFS Modify ONLY on the specific Package_* folder
+
+    Run as Administrator on the OLD server.
 #>
 
 [CmdletBinding()]
@@ -28,6 +32,64 @@ function Find-DbService {
     Where-Object { $_.Name -match '^(mysql|mariadb)' -or $_.DisplayName -match '(MySQL|MariaDB)' } |
     Sort-Object Status -Descending |
     Select-Object -First 1
+}
+
+function Get-ServiceBinaryPath {
+  param([string]$ServiceName)
+  $svcWmi = Get-WmiObject Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+  if (-not $svcWmi) { return $null }
+  # Extract the first quoted path or first token
+  $path = $svcWmi.PathName
+  if ($path -match '^"([^"]+)"') { return $matches[1] }
+  else { return ($path.Split(' '))[0] }
+}
+
+function Detect-DBVersion {
+  # Returns [pscustomobject] @{ Engine='MariaDB'|'MySQL'; VersionFull='10.5.22'; MajorMinor='10.5'; Bin='<path>' }
+  $svc = Find-DbService
+  if (-not $svc) { return $null }
+  $bin = Get-ServiceBinaryPath -ServiceName $svc.Name
+  if (-not (Test-Path $bin)) {
+    Write-Warning "DB service found ($($svc.Name)) but binary path not found. Falling back to generic mapping."
+    return [pscustomobject]@{ Engine=$svc.DisplayName; VersionFull=$null; MajorMinor=$null; Bin=$null }
+  }
+  $verOut = & $bin --version 2>&1
+  $engine = ($verOut -match 'MariaDB') ? 'MariaDB' : 'MySQL'
+  if ($verOut -match '(\d+\.\d+(\.\d+)?)') { $vf = $matches[1] } else { $vf = $null }
+  $mm = $null; if ($vf) { $mm = ($vf -split '\.')[0..1] -join '.' }
+  [pscustomobject]@{ Engine=$engine; VersionFull=$vf; MajorMinor=$mm; Bin=$bin }
+}
+
+function Get-ODTrialInfo {
+  param([string]$Engine,[string]$MajorMinor)
+  # Current Trial links from Open Dental (may change over time):
+  $trialDefault = 'https://opendental.com/TrialDownload-24-3-54.exe'   # general trial
+  $maria105     = 'https://opendental.com/TrialDownload-24-1-66.exe'   # MariaDB 10.5 trial
+  $mysql55      = 'https://opendental.com/TrialDownload-20-5-63.exe'   # MySQL 5.5 trial
+  $upgrade56    = 'https://opendental.com/site/mysql56update.html'     # MySQL 5.6 upgrade guide
+
+  $trialUrl = $trialDefault
+  $notes = @()
+
+  if ($Engine -match 'Maria' -and $MajorMinor -eq '10.5') {
+    $trialUrl = $maria105
+    $notes += 'MariaDB 10.5 installer.'
+  } elseif ($Engine -match 'MySQL' -and $MajorMinor -eq '5.5') {
+    $trialUrl = $mysql55
+    $notes += 'MySQL 5.5 installer.'
+  } elseif ($Engine -match 'MySQL' -and $MajorMinor -eq '5.6') {
+    # Per OD docs: install MySQL 5.5 trial first, then upgrade to 5.6 on the NEW server.
+    $trialUrl = $mysql55
+    $notes += 'Install MySQL 5.5 trial, then upgrade to 5.6 on NEW server.'
+  } else {
+    $notes += 'General trial installer (contains MariaDB).'
+  }
+
+  [pscustomobject]@{
+    trial_url   = $trialUrl
+    upgrade_url = ($Engine -match 'MySQL' -and $MajorMinor -eq '5.6') ? $upgrade56 : $null
+    notes       = ($notes -join ' ')
+  }
 }
 
 function Guess-DataDir {
@@ -81,7 +143,6 @@ function Find-AtoZPath {
     [int]$MaxDepth = 3
   )
   $candidates = @()
-
   try {
     Get-SmbShare -ErrorAction Stop |
       Where-Object { $_.Name -match 'OpenDentImages' -or $_.Path -match 'OpenDentImages' } |
@@ -89,11 +150,9 @@ function Find-AtoZPath {
         $candidates += [pscustomobject]@{ Path=$_.Path; Score=(Test-AtoZStructure $_.Path); Source='Share' }
       }
   } catch {}
-
   foreach ($p in @($Hint,'C:\OpenDentImages','D:\OpenDentImages','E:\OpenDentImages')) {
     if (Test-Path $p) { $candidates += [pscustomobject]@{ Path=$p; Score=(Test-AtoZStructure $p); Source='Common' } }
   }
-
   $roots = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null }
   foreach ($r in $roots) {
     $queue = @([pscustomobject]@{Path=$r.Root;Depth=0})
@@ -112,12 +171,10 @@ function Find-AtoZPath {
       }
     }
   }
-
   $pick = $candidates | Sort-Object Score -Descending | Select-Object -First 1
   if (-not $pick -or $pick.Score -lt 8) {
     $pick = [pscustomobject]@{ Path=$Hint; Score=0; Source='Fallback' }
   }
-
   if ($ConfirmAtoZ -and $candidates.Count -gt 1) {
     Write-Host "A-to-Z candidates (score):" -ForegroundColor Cyan
     $ordered = $candidates | Sort-Object Score -Descending
@@ -127,7 +184,6 @@ function Find-AtoZPath {
     $sel = Read-Host "Pick index (default 0)"
     if ($sel -match '^\d+$' -and [int]$sel -lt $ordered.Count) { $pick = $ordered[[int]$sel] }
   }
-
   $pick.Path
 }
 
@@ -145,15 +201,12 @@ function Ensure-Share {
   try {
     $share = Get-SmbShare -Name $Name -ErrorAction SilentlyContinue
     if (-not $share) {
-      # Share with CHANGE (write) for Everyone
       New-SmbShare -Name $Name -Path $Path -ChangeAccess 'Everyone' -CachingMode None | Out-Null
     } else {
-      # Ensure Everyone has CHANGE
       try { Revoke-SmbShareAccess -Name $Name -AccountName 'Everyone' -Force -ErrorAction SilentlyContinue } catch {}
       Grant-SmbShareAccess -Name $Name -AccountName 'Everyone' -AccessRight Change -Force | Out-Null
     }
   } catch {
-    # Fallback (legacy): grant CHANGE at share level
     cmd /c "net share $Name=`"$Path`" /GRANT:Everyone,CHANGE" | Out-Null
   }
 }
@@ -167,15 +220,11 @@ function Remove-Share {
 function Grant-NTFSModifyToEveryone {
   param([string]$Path)
   if (-not (Test-Path $Path -PathType Container)) { return }
-  try {
-    # Use SID for Everyone to avoid localization issues
-    icacls "$Path" /grant *S-1-1-0:(OI)(CI)M /T | Out-Null
-  } catch {
-    # Fallback using .NET ACLs
+  try { icacls "$Path" /grant *S-1-1-0:(OI)(CI)M /T | Out-Null }
+  catch {
     $acl  = Get-Acl $Path
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule('Everyone','Modify','ContainerInherit, ObjectInherit','None','Allow')
-    $acl.SetAccessRule($rule)
-    Set-Acl -AclObject $acl -Path $Path
+    $acl.SetAccessRule($rule); Set-Acl -AclObject $acl -Path $Path
   }
 }
 
@@ -203,67 +252,5 @@ foreach ($s in $toStop) { if ($s.Status -ne 'Stopped') { Stop-Service -Name $s.N
 Write-Verbose "Disabling services…"
 foreach ($s in $toStop) { try { Set-Service -Name $s.Name -StartupType Disabled } catch {} }
 
-# Discover paths
-$datadir = Guess-DataDir
-$myini   = Guess-MyIni
-$atoz    = Find-AtoZPath -Hint $AtoZPathHint -ConfirmAtoZ:$ConfirmAtoZ
-
-Write-Host "Database data dir : $datadir"
-if ($myini) { Write-Host "my.ini            : $myini" } else { Write-Warning "my.ini not found; continuing." }
-Write-Host "OpenDentImages    : $atoz"
-Write-Host ""
-
-# Copy DB data (cold copy)
-Write-Verbose "Copying database data folder…"
-Start-SafeCopy -Source $datadir -Dest $pkgDb -LogPath (Join-Path $logDir 'copy_db.log')
-
-# Copy my.ini
-if ($myini) { Copy-Item -Path $myini -Destination $pkgIni -Force }
-
-# Copy A-to-Z
-Write-Verbose "Copying OpenDentImages (A-to-Z)…"
-Start-SafeCopy -Source $atoz -Dest $pkgImg -LogPath (Join-Path $logDir 'copy_atoz.log')
-
-# Optionally rename A-to-Z to prevent writes
-if (-not $SkipRenameAtoZ) {
-  $parent = Split-Path $atoz -Parent
-  $newName = "OpenDentImages_old_$timeTag"
-  $newPath = Join-Path $parent $newName
-  try {
-    Rename-Item -Path $atoz -NewName $newName -ErrorAction Stop
-    Write-Host "Renamed A-to-Z to: $newPath  (prevents accidental writes)" -ForegroundColor Yellow
-  } catch {
-    Write-Warning "Could not rename A-to-Z: $_"
-  }
-}
-
-# Temp share for migration **with write enabled**
-Ensure-Share -Path $StagingRoot -Name $ShareName
-
-# Grant NTFS Modify to Everyone on the specific package folder only (so COPIED.txt can be created)
-Grant-NTFSModifyToEveryone -Path $pkgRoot
-
-$shareUNC = "\\$($env:COMPUTERNAME)\$ShareName"
-"ready=$timeTag`nsource=$shareUNC`npackage=$(Split-Path $pkgRoot -Leaf)" | Set-Content (Join-Path $pkgRoot 'READY.txt') -Encoding UTF8
-Write-Host "Temporary share exposed at: $shareUNC  (Everyone: Change)" -ForegroundColor Cyan
-Write-Host "Package located in: $pkgRoot" -ForegroundColor Cyan
-
-# Optionally block 3306 inbound on OLD server
-if (-not $NoFirewallBlock3306) {
-  if (-not (Get-NetFirewallRule -DisplayName 'Block MySQL 3306 (OD Migration)' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName 'Block MySQL 3306 (OD Migration)' -Direction Inbound -Action Block -Protocol TCP -LocalPort 3306 | Out-Null
-    Write-Host "Blocked inbound port 3306 on OLD server." -ForegroundColor Yellow
-  }
-}
-
-# Wait for new server signal
-Write-Host "`n=== Waiting for new server to write COPIED.txt … Ctrl+C to abort ==="
-$copiedFlag = Join-Path $pkgRoot 'COPIED.txt'
-while (-not (Test-Path $copiedFlag)) { Start-Sleep -Seconds 5 }
-
-# Cleanup share
-Write-Host "New server signaled copy complete." -ForegroundColor Green
-Write-Host "Removing temporary share…" -ForegroundColor Gray
-Remove-Share -Name $ShareName
-
-Write-Host "Old server is locked down. Leave services disabled to prevent clients reconnecting." -ForegroundColor Yellow
+# Discover paths + DB version
+$datadir = Guess-Data
